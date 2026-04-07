@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>音声メモ</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #0f0f0f; color: #fff;
+      min-height: 100vh; padding: 24px 16px;
+      max-width: 480px; margin: 0 auto;
+    }
+    h1 { font-size: 22px; font-weight: 700; margin-bottom: 24px; }
+    .card { background: #1a1a1a; border-radius: 14px; padding: 18px; margin-bottom: 16px; }
+    .card h2 { font-size: 11px; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
+    input[type="password"], input[type="text"] {
+      width: 100%; background: #2a2a2a; border: 1px solid #333;
+      border-radius: 8px; color: #fff; font-size: 16px; padding: 12px;
+    }
+    .btn {
+      width: 100%; padding: 16px; border: none; border-radius: 12px;
+      font-size: 17px; font-weight: 700; cursor: pointer; margin-top: 10px;
+    }
+    .btn-red   { background: #ff4444; color: #fff; }
+    .btn-dark  { background: #2a2a2a; color: #888; }
+    .btn-red:disabled { background: #553333; }
+    .btn-red.pulse { animation: pulse 1s infinite; }
+    .box {
+      min-height: 90px; border-radius: 10px; padding: 14px;
+      font-size: 16px; line-height: 1.7; white-space: pre-wrap;
+    }
+    .box-raw    { background: #222; color: #bbb; }
+    .box-result { background: #1e1e2e; border: 1px solid #333; color: #eee; }
+    .status { font-size: 13px; color: #555; text-align: center; margin-top: 14px; }
+    .status.ok  { color: #44cc44; }
+    .status.err { color: #ff4444; }
+    .rec-ring {
+      width: 80px; height: 80px; border-radius: 50%;
+      background: #ff4444; margin: 0 auto 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 34px; cursor: pointer; border: none;
+      transition: transform .15s;
+    }
+    .rec-ring:active { transform: scale(.93); }
+    .rec-ring.on { animation: pulse 1s infinite; background: #cc0000; }
+    .rec-wrap { text-align: center; }
+    .rec-label { font-size: 13px; color: #666; margin-top: 4px; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.6} }
+    .saved-count { font-size: 28px; font-weight: 900; color: #ff4444; }
+    .saved-label { font-size: 12px; color: #666; margin-top: 2px; }
+  </style>
+</head>
+<body>
+
+<h1>🎙 音声メモ</h1>
+
+<!-- 初回設定 -->
+<div id="setup" style="display:none">
+  <div class="card">
+    <h2>GitHub Token</h2>
+    <input type="password" id="gh-token" placeholder="ghp_...">
+  </div>
+  <div class="card">
+    <h2>Groq API Key</h2>
+    <input type="password" id="groq-key" placeholder="gsk_...">
+  </div>
+  <button class="btn btn-red" onclick="saveSetup()">始める</button>
+</div>
+
+<!-- メイン -->
+<div id="main" style="display:none">
+
+  <!-- 溜まったメモ数 -->
+  <div class="card" style="text-align:center">
+    <div class="saved-count" id="pending-count">...</div>
+    <div class="saved-label">件 保存済み（未フラッシュ）</div>
+  </div>
+
+  <!-- 録音ボタン -->
+  <div class="card">
+    <div class="rec-wrap">
+      <button class="rec-ring" id="rec-ring" onclick="toggleRecord()">🎙</button>
+      <div class="rec-label" id="rec-label">タップして話す</div>
+    </div>
+  </div>
+
+  <!-- 文字起こし -->
+  <div class="card" id="transcript-card" style="display:none">
+    <h2>文字起こし</h2>
+    <div class="box box-raw" id="transcript"></div>
+    <button class="btn btn-red" id="refine-btn" onclick="refine()" style="display:none">Groqで整える →</button>
+  </div>
+
+  <!-- 整えた結果 -->
+  <div class="card" id="result-card" style="display:none">
+    <h2>整えた文章</h2>
+    <div class="box box-result" id="result"></div>
+    <button class="btn btn-red" onclick="saveMemo()">GitHubに保存 ✓</button>
+    <button class="btn btn-dark" onclick="discard()">やり直す</button>
+  </div>
+
+  <p class="status" id="status"></p>
+  <button class="btn btn-dark" onclick="resetSetup()" style="margin-top:8px">設定リセット</button>
+</div>
+
+<script>
+const OWNER = 'artista03';
+const REPO  = 'voice-memos';
+const FILE  = 'pending.json';
+
+let GH_TOKEN = '', GROQ_KEY = '';
+let recognition = null, isRecording = false, rawText = '';
+let pending = [], fileSha = null;
+
+// 起動
+GH_TOKEN  = localStorage.getItem('vm_gh_token')  || '';
+GROQ_KEY  = localStorage.getItem('vm_groq_key')  || '';
+if (GH_TOKEN && GROQ_KEY) showMain();
+else document.getElementById('setup').style.display = 'block';
+
+function saveSetup() {
+  const gh = document.getElementById('gh-token').value.trim();
+  const gk = document.getElementById('groq-key').value.trim();
+  if (!gh || !gk) { alert('両方入力してください'); return; }
+  localStorage.setItem('vm_gh_token', gh);
+  localStorage.setItem('vm_groq_key', gk);
+  GH_TOKEN = gh; GROQ_KEY = gk;
+  showMain();
+}
+function resetSetup() {
+  localStorage.removeItem('vm_gh_token');
+  localStorage.removeItem('vm_groq_key');
+  location.reload();
+}
+
+async function showMain() {
+  document.getElementById('setup').style.display = 'none';
+  document.getElementById('main').style.display = 'block';
+  initRecognition();
+  await loadPending();
+}
+
+// pending.json 読み込み
+async function loadPending() {
+  try {
+    const res = await fetch(`https://api.github.com/repos/${OWNER}/${REPO}/contents/${FILE}`, {
+      headers: { Authorization: `token ${GH_TOKEN}` }
+    });
+    if (res.status === 404) { pending = []; fileSha = null; }
+    else {
+      const d = await res.json();
+      fileSha = d.sha;
+      pending = JSON.parse(atob(d.content.replace(/\n/g,'')));
+    }
+  } catch(e) { pending = []; }
+  document.getElementById('pending-count').textContent = pending.length;
+}
+
+// pending.json 保存
+async function savePending() {
+  const content = btoa(unescape(encodeURIComponent(JSON.stringify(pending, null, 2))));
+  const body = { message: `memo ${dateJST()}`, content, ...(fileSha ? {sha: fileSha} : {}) };
+  const res = await fetch(`https://api.github.com/repos/${OWNER}/${REPO}/contents/${FILE}`, {
+    method: 'PUT',
+    headers: { Authorization: `token ${GH_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (res.status === 409) {
+    await loadPending();
+    return savePending();
+  }
+  const d = await res.json();
+  fileSha = d.content.sha;
+}
+
+// 音声認識
+function initRecognition() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { setStatus('Chromeで開いてください', 'err'); return; }
+  recognition = new SR();
+  recognition.lang = 'ja-JP';
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  let final = '';
+  recognition.onresult = e => {
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      if (e.results[i].isFinal) final += e.results[i][0].transcript;
+      else interim += e.results[i][0].transcript;
+    }
+    rawText = final + interim;
+    document.getElementById('transcript').textContent = rawText;
+    document.getElementById('transcript-card').style.display = 'block';
+  };
+  recognition.onend = () => { if (isRecording) recognition.start(); };
+  recognition.onerror = e => setStatus('エラー: ' + e.error, 'err');
+}
+
+function toggleRecord() {
+  if (!recognition) return;
+  const ring = document.getElementById('rec-ring');
+  const label = document.getElementById('rec-label');
+  if (!isRecording) {
+    isRecording = true;
+    rawText = '';
+    document.getElementById('transcript').textContent = '';
+    document.getElementById('transcript-card').style.display = 'none';
+    document.getElementById('refine-btn').style.display = 'none';
+    document.getElementById('result-card').style.display = 'none';
+    ring.textContent = '⏹';
+    ring.classList.add('on');
+    label.textContent = '録音中... タップで停止';
+    recognition.start();
+  } else {
+    isRecording = false;
+    recognition.stop();
+    ring.textContent = '🎙';
+    ring.classList.remove('on');
+    label.textContent = 'タップして話す';
+    if (rawText.trim()) {
+      document.getElementById('refine-btn').style.display = 'block';
+      setStatus('録音完了。Groqで整えてください。');
+    }
+  }
+}
+
+// Groq
+async function refine() {
+  if (!rawText.trim()) return;
+  const btn = document.getElementById('refine-btn');
+  btn.disabled = true;
+  btn.textContent = '整えています...';
+  setStatus('Groqが処理中...');
+
+  const prompt = `以下は音声入力した日本語の生テキストだ。
+誤字・文章のつながりを自然に整えてメモとして読みやすくしろ。
+内容・ニュアンスは一切変えるな。元の言葉の雰囲気を残せ。
+整えた文章だけを出力しろ。説明・前置き不要。
+
+【生テキスト】
+${rawText}`;
+
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEY}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 600, temperature: 0.7
+      })
+    });
+    const d = await res.json();
+    if (d.error) throw new Error(d.error.message);
+    const text = d.choices?.[0]?.message?.content || '';
+    document.getElementById('result').textContent = text;
+    document.getElementById('result-card').style.display = 'block';
+    setStatus('確認して保存してください。', 'ok');
+  } catch(e) {
+    setStatus('エラー: ' + e.message, 'err');
+  }
+  btn.disabled = false;
+  btn.textContent = 'Groqで整える →';
+}
+
+// GitHubに保存
+async function saveMemo() {
+  const text = document.getElementById('result').textContent;
+  if (!text) return;
+  setStatus('GitHubに保存中...');
+  pending.push({ ts: Date.now(), date: dateJST(), text });
+  try {
+    await savePending();
+    document.getElementById('pending-count').textContent = pending.length;
+    setStatus(`保存しました ✓（計${pending.length}件）`, 'ok');
+    discard();
+  } catch(e) {
+    pending.pop();
+    setStatus('保存エラー: ' + e.message, 'err');
+  }
+}
+
+function discard() {
+  rawText = '';
+  document.getElementById('transcript-card').style.display = 'none';
+  document.getElementById('result-card').style.display = 'none';
+  document.getElementById('refine-btn').style.display = 'none';
+  document.getElementById('refine-btn').textContent = 'Groqで整える →';
+}
+
+function dateJST() {
+  const d = new Date();
+  d.setTime(d.getTime() + 9*60*60*1000);
+  return d.toISOString().slice(0,10);
+}
+function setStatus(msg, type='') {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = 'status' + (type ? ' '+type : '');
+}
+</script>
+</body>
+</html>
